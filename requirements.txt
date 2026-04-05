@@ -1,0 +1,10 @@
+flask
+gunicorn
+google-auth
+google-auth-oauthlib
+google-auth-httplib2
+google-api-python-client
+google-cloud-secret-manager
+gspread
+requests
+python-dotenv
