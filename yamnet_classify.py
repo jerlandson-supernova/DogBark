@@ -8,7 +8,9 @@ import csv
 import os
 
 import numpy as np
+import tflite_runtime.interpreter as tflite
 from scipy.io import wavfile
+from scipy.signal import resample
 
 _interpreter = None
 _class_names = None
@@ -16,6 +18,7 @@ _class_names = None
 MODEL_PATH = os.environ.get("YAMNET_MODEL_PATH", "/app/yamnet.tflite")
 CLASS_MAP_PATH = os.environ.get("YAMNET_CLASS_MAP_PATH", "/app/yamnet_class_map.csv")
 
+YAMNET_SAMPLE_RATE = 16000
 DOG_CLASS_INDICES = {70, 71, 72, 73, 74, 75}
 DOG_CONFIDENCE_THRESHOLD = 0.25
 
@@ -24,7 +27,6 @@ def _load_model():
     global _interpreter
     if _interpreter is not None:
         return _interpreter
-    import tflite_runtime.interpreter as tflite
     _interpreter = tflite.Interpreter(model_path=MODEL_PATH)
     _interpreter.allocate_tensors()
     return _interpreter
@@ -58,9 +60,8 @@ def _read_wav_as_float(wav_path):
     if len(data.shape) > 1:
         data = data.mean(axis=1)
 
-    if sample_rate != 16000:
-        from scipy.signal import resample
-        num_samples = int(len(data) * 16000 / sample_rate)
+    if sample_rate != YAMNET_SAMPLE_RATE:
+        num_samples = int(len(data) * YAMNET_SAMPLE_RATE / sample_rate)
         data = resample(data, num_samples).astype(np.float32)
 
     return data

@@ -5,7 +5,7 @@ import math
 import os
 import subprocess
 import tempfile
-from datetime import datetime, timedelta
+from datetime import datetime
 from zoneinfo import ZoneInfo
 
 import gspread
@@ -29,6 +29,9 @@ OAUTH_CLIENT_SECRET = os.environ.get("OAUTH_CLIENT_SECRET")
 SPREADSHEET_ID = os.environ.get("SPREADSHEET_ID")
 SHEET_NAME = os.environ.get("SHEET_NAME", "Sheet1")
 AUDIO_BUCKET = os.environ.get("AUDIO_BUCKET", "dogbark-audio-clips")
+AUDIO_CAPTURE_SECONDS = 8
+AUDIO_SAMPLE_RATE = 16000
+FFMPEG_TIMEOUT_SECONDS = 30
 LOCAL_TZ = ZoneInfo("America/Los_Angeles")
 SUMMARY_SHEET_NAME = "Summary"
 SESSION_GAP_MINUTES = 5
@@ -92,26 +95,6 @@ def get_camera_name(device_path, creds):
     return short_id
 
 
-def get_event_image_url(device_path, event_id, creds):
-    """Call GenerateImage on the SDM API to get a snapshot URL for the event.
-    Event images expire 30 seconds after the event is published.
-    """
-    url = f"{SDM_BASE_URL}/{device_path}:executeCommand"
-    body = {
-        "command": "sdm.devices.commands.CameraEventImage.GenerateImage",
-        "params": {"eventId": event_id},
-    }
-    resp = req_lib.post(url, headers=get_sdm_headers(creds), json=body)
-    if resp.status_code == 200:
-        results = resp.json().get("results", {})
-        return results.get("url", "")
-    logger.warning("GenerateImage failed: %s %s", resp.status_code, resp.text)
-    return ""
-
-
-AUDIO_CAPTURE_SECONDS = 8
-
-
 def capture_audio_from_stream(device_path, creds):
     """Start an RTSP stream, capture audio with FFmpeg, return WAV path and stream token."""
     url = f"{SDM_BASE_URL}/{device_path}:executeCommand"
@@ -142,17 +125,17 @@ def capture_audio_from_stream(device_path, creds):
             "-t", str(AUDIO_CAPTURE_SECONDS),
             "-vn",
             "-acodec", "pcm_s16le",
-            "-ar", "16000",
+            "-ar", str(AUDIO_SAMPLE_RATE),
             "-ac", "1",
             wav_path,
         ]
-        proc = subprocess.run(cmd, capture_output=True, timeout=30)
+        proc = subprocess.run(cmd, capture_output=True, timeout=FFMPEG_TIMEOUT_SECONDS)
         if proc.returncode != 0:
             logger.warning("FFmpeg failed: %s", proc.stderr.decode(errors="replace")[-500:])
             os.unlink(wav_path)
             return None, stream_token
     except subprocess.TimeoutExpired:
-        logger.warning("FFmpeg timed out after 30s")
+        logger.warning("FFmpeg timed out after %ds", FFMPEG_TIMEOUT_SECONDS)
         os.unlink(wav_path)
         return None, stream_token
 
