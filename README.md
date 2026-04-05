@@ -1,8 +1,12 @@
 # DogBark
 
-Tired of your neighbors dog barking non stop and want to create a log of such events? Well then DogBark might be the solution for you, this ReadMe will help you set up an automated dog bark detector using a Google Nest camera and the Smart Device Management (SDM) API.
-It captures camera sound events in real time, classifies the audio with YAMNet to determine whether the
+Automated dog bark detector using a Google Nest camera and the Smart Device Management (SDM) API.
+Captures camera sound events in real time, classifies the audio with YAMNet to determine whether the
 sound is a dog barking, and logs each event to a Google Sheet -- all running serverless on Google Cloud Run.
+
+Confirmed dog barking events are recorded as permanent WAV audio clips in Cloud Storage.
+A Summary tab tracks barking sessions with duration and local time, plus auto-updating daily
+and weekly charts.
 
 ## Architecture
 
@@ -11,13 +15,17 @@ Nest Camera  -->  Google SDM  -->  Cloud Pub/Sub (push)  -->  Cloud Run (Flask)
                                                                   |
                                                         +---------+---------+
                                                         |                   |
-                                                  RTSP stream         Event image
-                                                  via FFmpeg          via SDM API
+                                                  RTSP stream         Cloud Storage
+                                                  via FFmpeg          (WAV upload)
                                                         |                   |
                                                   YAMNet TFLite            |
                                                   classification           |
                                                         |                   |
                                                         +----> Google Sheet <+
+                                                               |         |
+                                                            Sheet1    Summary
+                                                          (raw log)  (sessions
+                                                                      + charts)
 ```
 
 When the Nest camera detects a sound, SDM publishes a `CameraSound.Sound` event to a Pub/Sub topic.
@@ -28,11 +36,16 @@ Pub/Sub pushes the event (authenticated via OIDC) to the Cloud Run service, whic
 3. Runs YAMNet (TensorFlow Lite, 521 AudioSet classes) to classify the sound
 4. Tags the event as **Dog Barking** or **Other Sound** based on dog-related class scores
 5. For dog barking events, uploads the WAV clip to Cloud Storage for permanent playback
-6. Appends a row to the Google Sheet with timestamp, camera name, event type, classification details, and audio URL
+6. Appends a row to Sheet1 with timestamp, camera name, event type, classification details, and audio URL
+7. Updates the Summary tab with session duration tracking
 
 Motion and person detection events are also logged without audio classification.
 
-## Google Sheet columns
+## Google Sheet
+
+### Sheet1 -- Raw Event Log
+
+Every camera event gets a row here.
 
 | Column | Description |
 |--------|-------------|
@@ -43,6 +56,45 @@ Motion and person detection events are also logged without audio classification.
 | Event Session ID | Groups related events from the same session |
 | Audio URL | Cloud Storage link to the 8s WAV clip (dog barking events only) |
 | Notes | YAMNet top classification and confidence scores |
+
+### Summary -- Session Tracking and Charts
+
+Bark events are grouped into **sessions**. If two barks are less than 5 minutes apart, they
+belong to the same session. If 5+ minutes pass without barking, a new session starts.
+
+| Column | Description |
+|--------|-------------|
+| Date | Local date (Pacific time) |
+| Start Time | When the barking session started, e.g. `3:16 PM` |
+| End Time | When the last bark in the session occurred |
+| Duration (min) | Total minutes from start to end of the session |
+| Bark Count | Number of individual bark events in the session |
+| Week | ISO week label, e.g. `2026-W14` |
+
+Two embedded column charts update automatically as new sessions are logged:
+
+- **Daily Bark Minutes** -- total minutes of barking per day
+- **Weekly Bark Minutes** -- total minutes of barking per week
+
+The charts are driven by `UNIQUE` + `SUMIF` helper formulas in columns H-L that
+aggregate the session data. No manual maintenance required.
+
+## Similar Projects
+
+- [jatacid/dogbarkingdetector](https://github.com/jatacid/dogbarkingdetector) --
+  Browser-based dog bark detector using YAMNet via TensorFlow.js. Runs client-side
+  with microphone input. No Nest camera integration.
+- [MalcolmMielle/bark_monitor](https://codeberg.org/MalcolmMielle/bark_monitor) --
+  Python tool that records audio while you're away and detects barking via YAMNet.
+  Sends notifications via Matrix/Telegram. Uses a local microphone, not a camera API.
+- [tlynam/calm-barking-dog](https://github.com/tlynam/calm-barking-dog) --
+  Plays calming sounds to a dog when barking is detected.
+- [dogbarkingdetector.com](https://dogbarkingdetector.com/) --
+  Online tool using YAMNet for browser-based bark detection.
+
+DogBark differs from these by using the Nest camera's built-in microphone via the SDM API
+RTSP stream, running serverless on Cloud Run (no local hardware needed), and maintaining
+a structured Google Sheet with session tracking and trend charts.
 
 ## Prerequisites
 
@@ -61,13 +113,13 @@ Motion and person detection events are also logged without audio classification.
 | Cloud Storage | Stores WAV audio clips of dog barking events |
 | Secret Manager | Stores the OAuth refresh token |
 | Artifact Registry | Stores the Docker container image |
-| Google Sheets API | Writes event log rows |
+| Google Sheets API | Writes event log rows and session tracking |
 
 ## Project structure
 
 ```
 .
-├── nest_dog_bark_logger.py   # Flask app: event handler, RTSP capture, Sheet logging
+├── nest_dog_bark_logger.py   # Flask app: SDMClient, AudioClassifier, SheetLogger classes
 ├── yamnet_classify.py        # YAMNet TFLite inference for dog bark detection
 ├── auth_setup.py             # One-time local script for OAuth consent flow
 ├── Dockerfile                # Container: Python 3.11, FFmpeg, YAMNet model
@@ -143,7 +195,7 @@ gcloud run deploy nest-bark-logger \
   --region=us-central1 \
   --source=. \
   --no-allow-unauthenticated \
-  --set-env-vars="GCP_PROJECT_ID=...,DEVICE_ACCESS_PROJECT_ID=...,OAUTH_CLIENT_ID=...,OAUTH_CLIENT_SECRET=...,SPREADSHEET_ID=...,SHEET_NAME=Sheet1" \
+  --set-env-vars="GCP_PROJECT_ID=...,DEVICE_ACCESS_PROJECT_ID=...,OAUTH_CLIENT_ID=...,OAUTH_CLIENT_SECRET=...,SPREADSHEET_ID=...,SHEET_NAME=Sheet1,AUDIO_BUCKET=dogbark-audio-clips" \
   --memory=512Mi \
   --timeout=120 \
   --min-instances=0 \
@@ -236,8 +288,8 @@ threshold (default 0.25). The threshold can be adjusted in `yamnet_classify.py` 
 
 The service runs on Cloud Run with `min-instances=0`, so it only incurs cost when processing events.
 A single camera generating a few dozen sound events per day stays well within Cloud Run's free tier
-(2 million requests/month, 360,000 GB-seconds). Pub/Sub, Secret Manager, and Sheets API usage are
-similarly minimal. The only fixed cost is the $5 one-time Device Access registration fee.
+(2 million requests/month, 360,000 GB-seconds). Pub/Sub, Secret Manager, Cloud Storage, and Sheets
+API usage are similarly minimal. The only fixed cost is the $5 one-time Device Access registration fee.
 
 ## Limitations
 
@@ -249,6 +301,8 @@ similarly minimal. The only fixed cost is the $5 one-time Device Access registra
 - The OAuth refresh token must be used within 6 months or Google may revoke it. Each Cloud Run
   invocation refreshes the access token, which keeps the refresh token alive.
 - SDM may suppress rapid repeated similar events (event filtering).
+- Session gap threshold is 5 minutes by default. Adjust `SESSION_GAP_MINUTES` in
+  `nest_dog_bark_logger.py` if needed.
 
 ## License
 
