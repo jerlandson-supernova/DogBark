@@ -1,9 +1,12 @@
 import base64
 import json
 import logging
+import math
 import os
 import subprocess
 import tempfile
+from datetime import datetime, timedelta
+from zoneinfo import ZoneInfo
 
 import gspread
 import requests as req_lib
@@ -26,6 +29,9 @@ OAUTH_CLIENT_SECRET = os.environ.get("OAUTH_CLIENT_SECRET")
 SPREADSHEET_ID = os.environ.get("SPREADSHEET_ID")
 SHEET_NAME = os.environ.get("SHEET_NAME", "Sheet1")
 AUDIO_BUCKET = os.environ.get("AUDIO_BUCKET", "dogbark-audio-clips")
+LOCAL_TZ = ZoneInfo("America/Los_Angeles")
+SUMMARY_SHEET_NAME = "Summary"
+SESSION_GAP_MINUTES = 5
 
 SDM_BASE_URL = "https://smartdevicemanagement.googleapis.com/v1"
 TOKEN_URI = "https://oauth2.googleapis.com/token"
@@ -214,8 +220,8 @@ def classify_event(event_key):
     return labels.get(event_key, event_key)
 
 
-def append_to_sheet(row_data):
-    """Append a row to the configured Google Sheet."""
+def get_sheets_client():
+    """Get an authenticated gspread client."""
     refresh_token = get_refresh_token()
     creds = Credentials(
         token=None,
@@ -226,11 +232,166 @@ def append_to_sheet(row_data):
         scopes=["https://www.googleapis.com/auth/spreadsheets"],
     )
     creds.refresh(AuthRequest())
+    return gspread.authorize(creds)
 
-    gc = gspread.authorize(creds)
+
+def setup_summary_sheet(spreadsheet):
+    """Create the Summary worksheet with headers and helper formulas if it doesn't exist."""
+    try:
+        spreadsheet.worksheet(SUMMARY_SHEET_NAME)
+        return
+    except gspread.exceptions.WorksheetNotFound:
+        pass
+
+    ws = spreadsheet.add_worksheet(title=SUMMARY_SHEET_NAME, rows=1000, cols=12)
+
+    headers = [
+        ["Date", "Start Time", "End Time", "Duration (min)", "Bark Count", "Week",
+         "", "Date", "Minutes", "", "Week", "Minutes"],
+    ]
+    ws.update("A1:L1", headers, value_input_option="USER_ENTERED")
+
+    ws.format("A1:L1", {"textFormat": {"bold": True}})
+
+    formulas = [
+        ['=IFERROR(SORT(UNIQUE(FILTER(A2:A, A2:A<>""))),"")'],
+        ['=ARRAYFORMULA(IF(H2:H="","",SUMIF(A$2:A,H2:H,D$2:D)))'],
+        [""],
+        ['=IFERROR(SORT(UNIQUE(FILTER(F2:F, F2:F<>""))),"")'],
+        ['=ARRAYFORMULA(IF(K2:K="","",SUMIF(F$2:F,K2:K,D$2:D)))'],
+    ]
+    ws.update("H2:L2", [formulas[0] + [""] + formulas[3]], value_input_option="USER_ENTERED")
+    ws.update("I2", [[formulas[1][0]]], value_input_option="USER_ENTERED")
+    ws.update("L2", [[formulas[4][0]]], value_input_option="USER_ENTERED")
+
+    create_summary_charts(spreadsheet, ws)
+    logger.info("Created Summary sheet with headers, formulas, and charts")
+
+
+def create_summary_charts(spreadsheet, summary_ws):
+    """Add daily and weekly bark-minutes charts to the Summary sheet."""
+    sheet_id = summary_ws.id
+
+    daily_chart = {
+        "addChart": {
+            "chart": {
+                "position": {"overlayPosition": {"anchorCell": {"sheetId": sheet_id, "rowIndex": 3, "columnIndex": 7}}},
+                "spec": {
+                    "title": "Daily Bark Minutes",
+                    "basicChart": {
+                        "chartType": "COLUMN",
+                        "legendPosition": "NO_LEGEND",
+                        "axis": [
+                            {"position": "BOTTOM_AXIS", "title": "Date"},
+                            {"position": "LEFT_AXIS", "title": "Minutes"},
+                        ],
+                        "domains": [{"domain": {"sourceRange": {"sources": [
+                            {"sheetId": sheet_id, "startRowIndex": 0, "endRowIndex": 500,
+                             "startColumnIndex": 7, "endColumnIndex": 8}
+                        ]}}}],
+                        "series": [{"series": {"sourceRange": {"sources": [
+                            {"sheetId": sheet_id, "startRowIndex": 0, "endRowIndex": 500,
+                             "startColumnIndex": 8, "endColumnIndex": 9}
+                        ]}}, "targetAxis": "LEFT_AXIS"}],
+                        "headerCount": 1,
+                    },
+                },
+            }
+        }
+    }
+
+    weekly_chart = {
+        "addChart": {
+            "chart": {
+                "position": {"overlayPosition": {"anchorCell": {"sheetId": sheet_id, "rowIndex": 20, "columnIndex": 7}}},
+                "spec": {
+                    "title": "Weekly Bark Minutes",
+                    "basicChart": {
+                        "chartType": "COLUMN",
+                        "legendPosition": "NO_LEGEND",
+                        "axis": [
+                            {"position": "BOTTOM_AXIS", "title": "Week"},
+                            {"position": "LEFT_AXIS", "title": "Minutes"},
+                        ],
+                        "domains": [{"domain": {"sourceRange": {"sources": [
+                            {"sheetId": sheet_id, "startRowIndex": 0, "endRowIndex": 500,
+                             "startColumnIndex": 10, "endColumnIndex": 11}
+                        ]}}}],
+                        "series": [{"series": {"sourceRange": {"sources": [
+                            {"sheetId": sheet_id, "startRowIndex": 0, "endRowIndex": 500,
+                             "startColumnIndex": 11, "endColumnIndex": 12}
+                        ]}}, "targetAxis": "LEFT_AXIS"}],
+                        "headerCount": 1,
+                    },
+                },
+            }
+        }
+    }
+
+    spreadsheet.batch_update({"requests": [daily_chart, weekly_chart]})
+
+
+def utc_to_local(utc_str):
+    """Parse a UTC ISO timestamp and convert to local (Pacific) datetime."""
+    utc_str = utc_str.replace("Z", "+00:00")
+    dt_utc = datetime.fromisoformat(utc_str)
+    return dt_utc.astimezone(LOCAL_TZ)
+
+
+def update_summary_session(gc, timestamp_utc):
+    """Track barking sessions on the Summary sheet.
+    Groups bark events into sessions separated by gaps of 5+ minutes.
+    """
+    spreadsheet = gc.open_by_key(SPREADSHEET_ID)
+    setup_summary_sheet(spreadsheet)
+    ws = spreadsheet.worksheet(SUMMARY_SHEET_NAME)
+
+    local_dt = utc_to_local(timestamp_utc)
+    local_date = local_dt.strftime("%Y-%m-%d")
+    local_time = local_dt.strftime("%-I:%M %p")
+    iso_week = f"{local_dt.isocalendar()[0]}-W{local_dt.isocalendar()[1]:02d}"
+
+    all_values = ws.get_all_values()
+    data_rows = [r for r in all_values[1:] if r[0]] if len(all_values) > 1 else []
+
+    extend_session = False
+    if data_rows:
+        last_row = data_rows[-1]
+        last_row_idx = len(all_values)
+        try:
+            last_date = last_row[0]
+            last_end_str = last_row[2]
+            last_end_dt = datetime.strptime(f"{last_date} {last_end_str}", "%Y-%m-%d %I:%M %p")
+            last_end_dt = last_end_dt.replace(tzinfo=LOCAL_TZ)
+            gap = (local_dt - last_end_dt).total_seconds() / 60.0
+            if gap < SESSION_GAP_MINUTES:
+                extend_session = True
+        except (ValueError, IndexError):
+            pass
+
+    if extend_session:
+        start_str = last_row[1]
+        start_dt = datetime.strptime(f"{last_row[0]} {start_str}", "%Y-%m-%d %I:%M %p")
+        duration = max(1, math.ceil((local_dt - start_dt.replace(tzinfo=LOCAL_TZ)).total_seconds() / 60.0))
+        bark_count = int(last_row[4]) + 1 if last_row[4].isdigit() else 2
+
+        row_range = f"A{last_row_idx}:F{last_row_idx}"
+        ws.update(row_range, [[last_row[0], start_str, local_time, duration, bark_count, last_row[5]]],
+                  value_input_option="USER_ENTERED")
+        logger.info("Extended session: %s %s-%s (%d min, %d barks)", last_row[0], start_str, local_time, duration, bark_count)
+    else:
+        new_row = [local_date, local_time, local_time, 1, 1, iso_week]
+        ws.append_row(new_row, value_input_option="USER_ENTERED")
+        logger.info("New session: %s %s", local_date, local_time)
+
+
+def append_to_sheet(row_data):
+    """Append a row to the raw events sheet."""
+    gc = get_sheets_client()
     sheet = gc.open_by_key(SPREADSHEET_ID).worksheet(SHEET_NAME)
     sheet.append_row(row_data, value_input_option="USER_ENTERED")
     logger.info("Appended row to sheet: %s", row_data)
+    return gc
 
 
 def process_sdm_event(envelope):
@@ -285,8 +446,14 @@ def process_sdm_event(envelope):
             audio_url,
             notes,
         ]
-        append_to_sheet(row)
+        gc = append_to_sheet(row)
         logger.info("Logged %s from %s at %s", event_label, camera_name, timestamp)
+
+        if event_label == "Dog Barking":
+            try:
+                update_summary_session(gc, timestamp)
+            except Exception:
+                logger.exception("Failed to update summary session")
 
 
 @app.route("/", methods=["POST"])
