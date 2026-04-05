@@ -4,8 +4,9 @@ import logging
 import os
 
 import gspread
-import requests
+import requests as req_lib
 from flask import Flask, request
+from google.auth.transport.requests import Request as AuthRequest
 from google.cloud import secretmanager
 from google.oauth2.credentials import Credentials
 
@@ -52,7 +53,7 @@ def get_oauth_credentials():
         client_id=OAUTH_CLIENT_ID,
         client_secret=OAUTH_CLIENT_SECRET,
     )
-    creds.refresh(requests.Request())
+    creds.refresh(AuthRequest())
     return creds
 
 
@@ -67,7 +68,7 @@ def get_camera_name(device_path, creds):
         return _device_name_cache[device_path]
 
     url = f"{SDM_BASE_URL}/{device_path}"
-    resp = requests.get(url, headers=get_sdm_headers(creds))
+    resp = req_lib.get(url, headers=get_sdm_headers(creds))
     if resp.status_code == 200:
         traits = resp.json().get("traits", {})
         custom_name = traits.get("sdm.devices.traits.Info", {}).get("customName", "")
@@ -89,7 +90,7 @@ def get_event_image_url(device_path, event_id, creds):
         "command": "sdm.devices.commands.CameraEventImage.GenerateImage",
         "params": {"eventId": event_id},
     }
-    resp = requests.post(url, headers=get_sdm_headers(creds), json=body)
+    resp = req_lib.post(url, headers=get_sdm_headers(creds), json=body)
     if resp.status_code == 200:
         results = resp.json().get("results", {})
         return results.get("url", "")
@@ -118,7 +119,7 @@ def append_to_sheet(row_data):
         client_secret=OAUTH_CLIENT_SECRET,
         scopes=["https://www.googleapis.com/auth/spreadsheets"],
     )
-    creds.refresh(requests.Request())
+    creds.refresh(AuthRequest())
 
     gc = gspread.authorize(creds)
     sheet = gc.open_by_key(SPREADSHEET_ID).worksheet(SHEET_NAME)
