@@ -9,6 +9,6 @@ google-cloud-storage
 gspread
 requests
 python-dotenv
+numpy<2
 tflite-runtime
 scipy
-numpy
