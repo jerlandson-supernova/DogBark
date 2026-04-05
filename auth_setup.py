@@ -29,6 +29,8 @@ SHEETS_SCOPE = "https://www.googleapis.com/auth/spreadsheets"
 SECRET_NAME = "nest-oauth-refresh-token"
 
 SDM_BASE_URL = "https://smartdevicemanagement.googleapis.com/v1"
+SPREADSHEET_ID = os.environ.get("SPREADSHEET_ID")
+SHEET_NAME = os.environ.get("SHEET_NAME", "Sheet1")
 
 
 def build_auth_url():
@@ -115,6 +117,28 @@ def list_devices(access_token):
     print("\nEvent delivery has been initiated. Events will now flow to your Pub/Sub topic.")
 
 
+def setup_sheet_headers(access_token):
+    """Write header row to the Google Sheet if row 1 is empty."""
+    if not SPREADSHEET_ID:
+        print("SPREADSHEET_ID not set, skipping sheet header setup.")
+        return
+
+    url = f"https://sheets.googleapis.com/v4/spreadsheets/{SPREADSHEET_ID}/values/{SHEET_NAME}!A1:G1"
+    headers = {"Authorization": f"Bearer {access_token}"}
+    resp = requests.get(url, headers=headers)
+    if resp.status_code == 200 and resp.json().get("values"):
+        print("Sheet headers already exist, skipping.")
+        return
+
+    header_row = [["Timestamp (UTC)", "Camera Name", "Event Type", "Event ID", "Event Session ID", "Image URL", "Notes"]]
+    update_url = f"https://sheets.googleapis.com/v4/spreadsheets/{SPREADSHEET_ID}/values/{SHEET_NAME}!A1:G1?valueInputOption=USER_ENTERED"
+    resp = requests.put(update_url, headers={**headers, "Content-Type": "application/json"}, json={"values": header_row})
+    if resp.status_code == 200:
+        print("Sheet headers written successfully.")
+    else:
+        print(f"Failed to write sheet headers: {resp.status_code} {resp.text}")
+
+
 def main():
     missing = []
     if not GCP_PROJECT_ID:
@@ -164,7 +188,10 @@ def main():
     print("\n--- Step 3: Store refresh token in Secret Manager ---")
     store_refresh_token(refresh_token)
 
-    print("\n--- Step 4: List devices and initiate events ---")
+    print("\n--- Step 4: Set up Google Sheet headers ---")
+    setup_sheet_headers(access_token)
+
+    print("\n--- Step 5: List devices and initiate events ---")
     list_devices(access_token)
 
     print("\nSetup complete. Your Cloud Run service will now receive events.")
