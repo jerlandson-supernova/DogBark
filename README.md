@@ -1,7 +1,7 @@
 # DogBark
 
-Automated dog bark detector using a Google Nest camera and the Smart Device Management (SDM) API.
-Captures camera sound events in real time, classifies the audio with YAMNet to determine whether the
+Tired of your neighbors dog barking non stop and want to create a log of such events? Well then DogBark might be the solution for you, this ReadMe will help you set up an automated dog bark detector using a Google Nest camera and the Smart Device Management (SDM) API.
+It captures camera sound events in real time, classifies the audio with YAMNet to determine whether the
 sound is a dog barking, and logs each event to a Google Sheet -- all running serverless on Google Cloud Run.
 
 ## Architecture
