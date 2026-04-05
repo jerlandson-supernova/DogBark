@@ -27,8 +27,8 @@ Pub/Sub pushes the event (authenticated via OIDC) to the Cloud Run service, whic
 2. Captures 8 seconds of audio with FFmpeg (16 kHz mono WAV)
 3. Runs YAMNet (TensorFlow Lite, 521 AudioSet classes) to classify the sound
 4. Tags the event as **Dog Barking** or **Other Sound** based on dog-related class scores
-5. Captures an event snapshot image from the camera (30-second expiry window)
-6. Appends a row to the Google Sheet with timestamp, camera name, event type, classification details, and image URL
+5. For dog barking events, uploads the WAV clip to Cloud Storage for permanent playback
+6. Appends a row to the Google Sheet with timestamp, camera name, event type, classification details, and audio URL
 
 Motion and person detection events are also logged without audio classification.
 
@@ -41,7 +41,7 @@ Motion and person detection events are also logged without audio classification.
 | Event Type | `Dog Barking`, `Other Sound`, `Motion Detected`, or `Person Detected` |
 | Event ID | SDM event identifier |
 | Event Session ID | Groups related events from the same session |
-| Image URL | Snapshot URL (expires 30s after event) |
+| Audio URL | Cloud Storage link to the 8s WAV clip (dog barking events only) |
 | Notes | YAMNet top classification and confidence scores |
 
 ## Prerequisites
@@ -58,6 +58,7 @@ Motion and person detection events are also logged without audio classification.
 | Smart Device Management API | Camera events and RTSP streams |
 | Cloud Pub/Sub | Async event delivery from SDM to Cloud Run |
 | Cloud Run | Serverless container hosting the Flask app |
+| Cloud Storage | Stores WAV audio clips of dog barking events |
 | Secret Manager | Stores the OAuth refresh token |
 | Artifact Registry | Stores the Docker container image |
 | Google Sheets API | Writes event log rows |
@@ -229,6 +230,7 @@ threshold (default 0.25). The threshold can be adjusted in `yamnet_classify.py` 
 | `OAUTH_CLIENT_SECRET` | OAuth 2.0 client secret |
 | `SPREADSHEET_ID` | Google Sheet ID (from the URL) |
 | `SHEET_NAME` | Worksheet name (default: `Sheet1`) |
+| `AUDIO_BUCKET` | Cloud Storage bucket for WAV clips (default: `dogbark-audio-clips`) |
 
 ## Cost
 
@@ -241,7 +243,7 @@ similarly minimal. The only fixed cost is the $5 one-time Device Access registra
 
 - The SDM API only supports legacy Nest cameras (Nest Cam Indoor/Outdoor/IQ, Nest Doorbell legacy,
   Nest Hub Max). Newer 2021+ cameras do not expose the `CameraSound` or `CameraLiveStream` traits.
-- Event images expire 30 seconds after the event is published.
+- Audio clips are only saved for events classified as Dog Barking (Other Sound events are not stored).
 - Audio classification depends on the RTSP stream being available. If the camera is offline or
   the stream fails, the event is logged as "Sound Detected" with a note that audio capture failed.
 - The OAuth refresh token must be used within 6 months or Google may revoke it. Each Cloud Run

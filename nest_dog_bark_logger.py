@@ -9,7 +9,7 @@ import gspread
 import requests as req_lib
 from flask import Flask, request
 from google.auth.transport.requests import Request as AuthRequest
-from google.cloud import secretmanager
+from google.cloud import secretmanager, storage
 from google.oauth2.credentials import Credentials
 
 from yamnet_classify import is_dog_barking
@@ -25,6 +25,7 @@ OAUTH_CLIENT_ID = os.environ.get("OAUTH_CLIENT_ID")
 OAUTH_CLIENT_SECRET = os.environ.get("OAUTH_CLIENT_SECRET")
 SPREADSHEET_ID = os.environ.get("SPREADSHEET_ID")
 SHEET_NAME = os.environ.get("SHEET_NAME", "Sheet1")
+AUDIO_BUCKET = os.environ.get("AUDIO_BUCKET", "dogbark-audio-clips")
 
 SDM_BASE_URL = "https://smartdevicemanagement.googleapis.com/v1"
 TOKEN_URI = "https://oauth2.googleapis.com/token"
@@ -164,23 +165,40 @@ def stop_rtsp_stream(device_path, stream_token, creds):
     req_lib.post(url, headers=get_sdm_headers(creds), json=body)
 
 
-def classify_sound_event(device_path, creds):
+def upload_audio_to_gcs(wav_path, timestamp):
+    """Upload a WAV file to Cloud Storage. Returns the public URL."""
+    safe_ts = timestamp.replace(":", "-").replace(".", "-")
+    blob_name = f"barks/{safe_ts}.wav"
+    client = storage.Client()
+    bucket = client.bucket(AUDIO_BUCKET)
+    blob = bucket.blob(blob_name)
+    blob.upload_from_filename(wav_path, content_type="audio/wav")
+    return f"https://storage.googleapis.com/{AUDIO_BUCKET}/{blob_name}"
+
+
+def classify_sound_event(device_path, creds, timestamp):
     """Capture audio from camera and classify with YAMNet.
-    Returns (event_label, notes_text).
+    Returns (event_label, notes_text, audio_url).
     """
     wav_path, stream_token = capture_audio_from_stream(device_path, creds)
     try:
         if wav_path is None:
-            return "Sound Detected", "Audio capture failed"
+            return "Sound Detected", "Audio capture failed", ""
 
         is_dog, top_class, top_conf, dog_conf = is_dog_barking(wav_path)
+        audio_url = ""
         if is_dog:
             label = "Dog Barking"
             notes = f"YAMNet: {top_class} ({top_conf:.0%}), dog_score={dog_conf:.0%}"
+            try:
+                audio_url = upload_audio_to_gcs(wav_path, timestamp)
+                logger.info("Uploaded bark audio: %s", audio_url)
+            except Exception:
+                logger.exception("Failed to upload audio to GCS")
         else:
             label = "Other Sound"
             notes = f"YAMNet: {top_class} ({top_conf:.0%}), dog_score={dog_conf:.0%}"
-        return label, notes
+        return label, notes, audio_url
     finally:
         if wav_path and os.path.exists(wav_path):
             os.unlink(wav_path)
@@ -251,13 +269,10 @@ def process_sdm_event(envelope):
         session_id = event_data.get("eventSessionId", "")
         camera_name = get_camera_name(device_path, creds)
 
-        image_url = ""
-        if event_id:
-            image_url = get_event_image_url(device_path, event_id, creds)
-
+        audio_url = ""
         notes = ""
         if event_key == SOUND_EVENT_KEY:
-            event_label, notes = classify_sound_event(device_path, creds)
+            event_label, notes, audio_url = classify_sound_event(device_path, creds, timestamp)
         else:
             event_label = classify_event(event_key)
 
@@ -267,7 +282,7 @@ def process_sdm_event(envelope):
             event_label,
             event_id,
             session_id,
-            image_url,
+            audio_url,
             notes,
         ]
         append_to_sheet(row)
