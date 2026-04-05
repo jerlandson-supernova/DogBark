@@ -1,4 +1,4 @@
-# DogBark
+# DogBark Detector
 
 Automated dog bark detector using a Google Nest camera and the Smart Device Management (SDM) API.
 Captures camera sound events in real time, classifies the audio with YAMNet to determine whether the
