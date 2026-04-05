@@ -153,7 +153,8 @@ class SDMClient:
 
     def generate_rtsp_stream(self, device_path, creds):
         """Request an RTSP live stream URL from the camera.
-        Returns (rtsp_url, stream_token) or (None, None) on failure.
+        Returns (rtsp_url, stream_extension_token) or (None, None) on failure.
+        The stream_extension_token is needed to stop the stream later.
         """
         resp = self._execute_command(
             device_path,
@@ -167,22 +168,27 @@ class SDMClient:
 
         results = resp.json().get("results", {})
         rtsp_url = results.get("streamUrls", {}).get("rtspUrl", "")
-        stream_token = results.get("streamToken", "")
+        extension_token = results.get("streamExtensionToken", "")
         if not rtsp_url:
             logger.warning("No RTSP URL in response")
             return None, None
-        return rtsp_url, stream_token
+        logger.info("RTSP stream generated, expires at %s", results.get("expiresAt", "unknown"))
+        return rtsp_url, extension_token
 
-    def stop_rtsp_stream(self, device_path, stream_token, creds):
-        """Stop an active RTSP stream."""
-        if not stream_token:
+    def stop_rtsp_stream(self, device_path, extension_token, creds):
+        """Stop an active RTSP stream using its extension token."""
+        if not extension_token:
             return
-        self._execute_command(
+        resp = self._execute_command(
             device_path,
             "sdm.devices.commands.CameraLiveStream.StopRtspStream",
-            {"streamExtensionToken": stream_token},
+            {"streamExtensionToken": extension_token},
             creds,
         )
+        if resp.status_code == 200:
+            logger.info("RTSP stream stopped")
+        else:
+            logger.warning("StopRtspStream failed: %s %s", resp.status_code, resp.text)
 
 
 # ===========================================================================
@@ -244,19 +250,21 @@ class AudioClassifier:
         Returns (event_label, notes, audio_url).
         """
         wav_path = None
-        stream_token = None
+        extension_token = None
 
         for attempt in range(RTSP_RETRY_ATTEMPTS):
-            rtsp_url, stream_token = self._sdm.generate_rtsp_stream(device_path, creds)
+            rtsp_url, extension_token = self._sdm.generate_rtsp_stream(device_path, creds)
             if rtsp_url is None:
                 logger.warning("RTSP stream generation failed (attempt %d/%d)", attempt + 1, RTSP_RETRY_ATTEMPTS)
                 continue
 
             wav_path = self._capture_wav(rtsp_url)
             if wav_path is not None:
+                logger.info("Audio captured successfully on attempt %d", attempt + 1)
                 break
-            logger.warning("FFmpeg capture failed (attempt %d/%d), retrying with fresh stream", attempt + 1, RTSP_RETRY_ATTEMPTS)
-            self._sdm.stop_rtsp_stream(device_path, stream_token, creds)
+            logger.warning("FFmpeg capture failed (attempt %d/%d), stopping stream and retrying", attempt + 1, RTSP_RETRY_ATTEMPTS)
+            self._sdm.stop_rtsp_stream(device_path, extension_token, creds)
+            extension_token = None
 
         try:
             if wav_path is None:
@@ -264,6 +272,7 @@ class AudioClassifier:
 
             is_dog, top_class, top_conf, dog_conf = is_dog_barking(wav_path)
             notes = f"YAMNet: {top_class} ({top_conf:.0%}), dog_score={dog_conf:.0%}"
+            logger.info("YAMNet result: is_dog=%s, top=%s (%.2f), dog_score=%.2f", is_dog, top_class, top_conf, dog_conf)
 
             audio_url = ""
             if is_dog:
@@ -280,7 +289,7 @@ class AudioClassifier:
         finally:
             if wav_path and os.path.exists(wav_path):
                 os.unlink(wav_path)
-            self._sdm.stop_rtsp_stream(device_path, stream_token, creds)
+            self._sdm.stop_rtsp_stream(device_path, extension_token, creds)
 
 
 # ===========================================================================
