@@ -43,6 +43,8 @@ AUDIO_CAPTURE_SECONDS = 8
 AUDIO_SAMPLE_RATE = 16000
 # Max time to wait for FFmpeg before killing the process
 FFMPEG_TIMEOUT_SECONDS = 30
+# RTSP stream URLs can expire; retry with a fresh URL on failure
+RTSP_RETRY_ATTEMPTS = 2
 
 # ---------------------------------------------------------------------------
 # Session tracking (Summary tab)
@@ -202,6 +204,8 @@ class AudioClassifier:
         cmd = [
             "ffmpeg", "-y",
             "-rtsp_transport", "tcp",
+            "-rtsp_flags", "prefer_tcp",
+            "-stimeout", "5000000",
             "-i", rtsp_url,
             "-t", str(AUDIO_CAPTURE_SECONDS),
             "-vn",
@@ -236,16 +240,27 @@ class AudioClassifier:
 
     def classify(self, device_path, creds, timestamp):
         """Capture audio from the camera and classify the sound.
+        Retries with a fresh RTSP URL if the first attempt fails (e.g. 404 from expired token).
         Returns (event_label, notes, audio_url).
         """
-        rtsp_url, stream_token = self._sdm.generate_rtsp_stream(device_path, creds)
-        if rtsp_url is None:
-            return "Sound Detected", "Audio capture failed", ""
+        wav_path = None
+        stream_token = None
 
-        wav_path = self._capture_wav(rtsp_url)
+        for attempt in range(RTSP_RETRY_ATTEMPTS):
+            rtsp_url, stream_token = self._sdm.generate_rtsp_stream(device_path, creds)
+            if rtsp_url is None:
+                logger.warning("RTSP stream generation failed (attempt %d/%d)", attempt + 1, RTSP_RETRY_ATTEMPTS)
+                continue
+
+            wav_path = self._capture_wav(rtsp_url)
+            if wav_path is not None:
+                break
+            logger.warning("FFmpeg capture failed (attempt %d/%d), retrying with fresh stream", attempt + 1, RTSP_RETRY_ATTEMPTS)
+            self._sdm.stop_rtsp_stream(device_path, stream_token, creds)
+
         try:
             if wav_path is None:
-                return "Sound Detected", "FFmpeg capture failed", ""
+                return "Sound Detected", "Audio capture failed after retries", ""
 
             is_dog, top_class, top_conf, dog_conf = is_dog_barking(wav_path)
             notes = f"YAMNet: {top_class} ({top_conf:.0%}), dog_score={dog_conf:.0%}"
