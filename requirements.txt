@@ -8,3 +8,6 @@ google-cloud-secret-manager
 gspread
 requests
 python-dotenv
+tflite-runtime
+scipy
+numpy

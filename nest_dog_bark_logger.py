@@ -2,6 +2,8 @@ import base64
 import json
 import logging
 import os
+import subprocess
+import tempfile
 
 import gspread
 import requests as req_lib
@@ -9,6 +11,8 @@ from flask import Flask, request
 from google.auth.transport.requests import Request as AuthRequest
 from google.cloud import secretmanager
 from google.oauth2.credentials import Credentials
+
+from yamnet_classify import is_dog_barking
 
 app = Flask(__name__)
 
@@ -98,10 +102,94 @@ def get_event_image_url(device_path, event_id, creds):
     return ""
 
 
+AUDIO_CAPTURE_SECONDS = 8
+
+
+def capture_audio_from_stream(device_path, creds):
+    """Start an RTSP stream, capture audio with FFmpeg, return WAV path and stream token."""
+    url = f"{SDM_BASE_URL}/{device_path}:executeCommand"
+    body = {
+        "command": "sdm.devices.commands.CameraLiveStream.GenerateRtspStream",
+        "params": {},
+    }
+    resp = req_lib.post(url, headers=get_sdm_headers(creds), json=body)
+    if resp.status_code != 200:
+        logger.warning("GenerateRtspStream failed: %s %s", resp.status_code, resp.text)
+        return None, None
+
+    results = resp.json().get("results", {})
+    rtsp_url = results.get("streamUrls", {}).get("rtspUrl", "")
+    stream_token = results.get("streamToken", "")
+    if not rtsp_url:
+        logger.warning("No RTSP URL in response")
+        return None, None
+
+    wav_fd, wav_path = tempfile.mkstemp(suffix=".wav")
+    os.close(wav_fd)
+
+    try:
+        cmd = [
+            "ffmpeg", "-y",
+            "-rtsp_transport", "tcp",
+            "-i", rtsp_url,
+            "-t", str(AUDIO_CAPTURE_SECONDS),
+            "-vn",
+            "-acodec", "pcm_s16le",
+            "-ar", "16000",
+            "-ac", "1",
+            wav_path,
+        ]
+        proc = subprocess.run(cmd, capture_output=True, timeout=30)
+        if proc.returncode != 0:
+            logger.warning("FFmpeg failed: %s", proc.stderr.decode(errors="replace")[-500:])
+            os.unlink(wav_path)
+            return None, stream_token
+    except subprocess.TimeoutExpired:
+        logger.warning("FFmpeg timed out after 30s")
+        os.unlink(wav_path)
+        return None, stream_token
+
+    return wav_path, stream_token
+
+
+def stop_rtsp_stream(device_path, stream_token, creds):
+    """Stop an active RTSP stream."""
+    if not stream_token:
+        return
+    url = f"{SDM_BASE_URL}/{device_path}:executeCommand"
+    body = {
+        "command": "sdm.devices.commands.CameraLiveStream.StopRtspStream",
+        "params": {"streamExtensionToken": stream_token},
+    }
+    req_lib.post(url, headers=get_sdm_headers(creds), json=body)
+
+
+def classify_sound_event(device_path, creds):
+    """Capture audio from camera and classify with YAMNet.
+    Returns (event_label, notes_text).
+    """
+    wav_path, stream_token = capture_audio_from_stream(device_path, creds)
+    try:
+        if wav_path is None:
+            return "Sound Detected", "Audio capture failed"
+
+        is_dog, top_class, top_conf, dog_conf = is_dog_barking(wav_path)
+        if is_dog:
+            label = "Dog Barking"
+            notes = f"YAMNet: {top_class} ({top_conf:.0%}), dog_score={dog_conf:.0%}"
+        else:
+            label = "Other Sound"
+            notes = f"YAMNet: {top_class} ({top_conf:.0%}), dog_score={dog_conf:.0%}"
+        return label, notes
+    finally:
+        if wav_path and os.path.exists(wav_path):
+            os.unlink(wav_path)
+        stop_rtsp_stream(device_path, stream_token, creds)
+
+
 def classify_event(event_key):
-    """Map SDM event keys to readable labels."""
+    """Map SDM event keys to readable labels for non-sound events."""
     labels = {
-        SOUND_EVENT_KEY: "Sound Detected",
         MOTION_EVENT_KEY: "Motion Detected",
         PERSON_EVENT_KEY: "Person Detected",
     }
@@ -162,11 +250,16 @@ def process_sdm_event(envelope):
         event_id = event_data.get("eventId", "")
         session_id = event_data.get("eventSessionId", "")
         camera_name = get_camera_name(device_path, creds)
-        event_label = classify_event(event_key)
 
         image_url = ""
         if event_id:
             image_url = get_event_image_url(device_path, event_id, creds)
+
+        notes = ""
+        if event_key == SOUND_EVENT_KEY:
+            event_label, notes = classify_sound_event(device_path, creds)
+        else:
+            event_label = classify_event(event_key)
 
         row = [
             timestamp,
@@ -175,7 +268,7 @@ def process_sdm_event(envelope):
             event_id,
             session_id,
             image_url,
-            "",
+            notes,
         ]
         append_to_sheet(row)
         logger.info("Logged %s from %s at %s", event_label, camera_name, timestamp)
