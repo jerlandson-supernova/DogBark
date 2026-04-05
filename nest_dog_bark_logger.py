@@ -210,8 +210,6 @@ class AudioClassifier:
         cmd = [
             "ffmpeg", "-y",
             "-rtsp_transport", "tcp",
-            "-rtsp_flags", "prefer_tcp",
-            "-stimeout", "5000000",
             "-i", rtsp_url,
             "-t", str(AUDIO_CAPTURE_SECONDS),
             "-vn",
@@ -223,7 +221,9 @@ class AudioClassifier:
         try:
             proc = subprocess.run(cmd, capture_output=True, timeout=FFMPEG_TIMEOUT_SECONDS)
             if proc.returncode != 0:
-                logger.warning("FFmpeg failed: %s", proc.stderr.decode(errors="replace")[-500:])
+                stderr = proc.stderr.decode(errors="replace")
+                error_lines = [l for l in stderr.split("\n") if "error" in l.lower() or "fail" in l.lower() or "404" in l or "Unrecognized" in l]
+                logger.warning("FFmpeg exit code %d: %s", proc.returncode, " | ".join(error_lines) if error_lines else stderr[-300:])
                 os.unlink(wav_path)
                 return None
         except subprocess.TimeoutExpired:
